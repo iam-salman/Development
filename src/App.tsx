@@ -34,7 +34,6 @@ import {
   ChevronsRight,
   Target,
   BatteryCharging,
-  Calendar,
   Clock,
   XCircle,
   Boxes,
@@ -46,9 +45,10 @@ import {
   Trash2,
   ZoomIn,
   Search,
+  Camera,
+  ShieldCheck,
   Settings,
-  Lock,
-  Loader2
+  RefreshCw
 } from "lucide-react";
 
 // --- Global Types & Styles ---
@@ -180,8 +180,34 @@ const GlobalStyles: FC = () => (
         cursor: pointer;
         box-shadow: 0 0 10px rgba(0,0,0,0.5);
     }
-    @keyframes scan { 0% { transform: translateY(0px); } 100% { transform: translateY(280px); } }
-    .animate-scan { animation: scan 2.5s cubic-bezier(0.65, 0, 0.35, 1) infinite alternate; }
+    
+    /* Enhanced Scan Animation - Laser Effect */
+    @keyframes scan-laser { 
+        0% { top: 0; opacity: 0; } 
+        15% { opacity: 1; }
+        85% { opacity: 1; }
+        100% { top: 100%; opacity: 0; } 
+    }
+    .scan-laser-line { 
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(to right, transparent, #ef4444, #ff0000, #ef4444, transparent);
+        box-shadow: 0 0 10px rgba(239, 68, 68, 0.8), 0 0 20px rgba(239, 68, 68, 0.5);
+        animation: scan-laser 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        z-index: 10;
+        border-radius: 50%;
+    }
+    
+    /* Success Pulse */
+    .success-scale-in {
+        animation: scale-in-bounce 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+    }
+    @keyframes scale-in-bounce {
+        0% { transform: scale(0.5); opacity: 0; }
+        100% { transform: scale(1); opacity: 1; }
+    }
   `}</style>
 );
 
@@ -249,13 +275,14 @@ const ToastContainer: FC<{ toasts: ToastItem[]; onDismiss: (id: number) => void;
   );
 };
 
-// --- SCANNER COMPONENT (REWRITTEN) ---
+// --- SCANNER COMPONENT (REWRITTEN FROM SCRATCH) ---
 
-type ScannerState = "idle" | "loading" | "scanning" | "error" | "permission_denied";
+type ScannerState = "idle" | "loading" | "scanning" | "error";
 interface ScannerProps {
   onScanSuccess: (decodedText: string) => void;
   onStateChange?: (state: ScannerState) => void;
   showToast: (msg: string, type?: ToastType) => void;
+  scannedResult?: { id: string } | null;
 }
 interface ScannerControls {
   start: () => Promise<void>;
@@ -265,7 +292,7 @@ interface ScannerControls {
 }
 
 const Scanner = forwardRef<ScannerControls, ScannerProps>(
-  ({ onScanSuccess, onStateChange, showToast }, ref) => {
+  ({ onScanSuccess, onStateChange, showToast, scannedResult }, ref) => {
     const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
     const [isTorchOn, setIsTorchOn] = useState(false);
     const [isTorchSupported, setIsTorchSupported] = useState(false);
@@ -276,89 +303,103 @@ const Scanner = forwardRef<ScannerControls, ScannerProps>(
       onStateChange?.(state);
     };
 
+    const cleanup = async () => {
+        if (html5QrCodeRef.current) {
+            if (html5QrCodeRef.current.isScanning) {
+                try { await html5QrCodeRef.current.stop(); } catch (e) { console.error("Error stopping scanner during cleanup", e); }
+            }
+            try { html5QrCodeRef.current.clear(); } catch(e) {}
+        }
+    };
+
     useImperativeHandle(ref, () => ({
       start: async () => {
-        if (!html5QrCodeRef.current) {
-           html5QrCodeRef.current = new Html5Qrcode("video-container", { verbose: false });
-        }
-        
-        if (html5QrCodeRef.current.isScanning) return;
-
         setState("loading");
+        await cleanup();
 
-        // Strategy: Try High Res first (better for small codes), then fallback to standard
-        const startCamera = async (widthIdeal: number) => {
+        // Step 1: Explicitly Request Permission via getUserMedia
+        // This is more reliable than Html5QrCode for triggering the browser prompt.
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: "environment" } 
+            });
+            // We got permission! Stop this stream so Html5Qrcode can take over smoothly.
+            stream.getTracks().forEach(track => track.stop());
+        } catch (err: any) {
+            console.error("Permission request failed", err);
+            setState("error");
+            if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+                showToast("Camera permission denied. Please allow camera access in browser settings.", "error");
+            } else if (err.name === "NotFoundError") {
+                showToast("No camera found on this device.", "error");
+            } else {
+                showToast(`Camera error: ${err.message}`, "error");
+            }
+            return;
+        }
+
+        // Step 2: Initialize Library
+        // Ensure DOM is ready
+        let attempts = 0;
+        while (!document.getElementById("video-container") && attempts < 10) {
+            await new Promise(r => setTimeout(r, 100));
+            attempts++;
+        }
+
+        if (!document.getElementById("video-container")) {
+            console.error("Video container DOM element missing");
+            setState("error");
+            return;
+        }
+
+        if (!html5QrCodeRef.current) {
+           try {
+             html5QrCodeRef.current = new Html5Qrcode("video-container", { verbose: false });
+           } catch(e) {
+             console.error("Failed to init Html5Qrcode", e);
+             setState("error");
+             return;
+           }
+        }
+
+        // Step 3: Start Scanning
+        try {
+            const config = {
+                fps: 10,
+                qrbox: { width: 250, height: 250 },
+                aspectRatio: 1.0, 
+            };
+            
+            await html5QrCodeRef.current.start(
+                { facingMode: "environment" },
+                config,
+                (decodedText) => onScanSuccess(decodedText),
+                () => {} 
+            );
+
+            // Get capabilities for UI
             try {
-                // Config for scanning
-                const config = {
-                    fps: 10,
-                    qrbox: { width: 250, height: 250 }, // Logical box, visuals handled by CSS
-                    aspectRatio: 1.0, // Force 1:1 ratio for the processing canvas to match our container roughly
-                };
-
-                // Constraints for the camera
-                const constraints = {
-                    facingMode: "environment",
-                    focusMode: "continuous", // Crucial for small codes
-                    width: { min: 640, ideal: widthIdeal, max: 3840 },
-                    height: { min: 480, ideal: widthIdeal, max: 3840 } 
-                };
-
-                await html5QrCodeRef.current!.start(
-                    constraints,
-                    config,
-                    (decodedText) => onScanSuccess(decodedText),
-                    () => {} // error callback (noisy, ignore)
-                );
-                
-                // After start, check capabilities
-                const capabilities = html5QrCodeRef.current!.getRunningTrackCapabilities();
-                
+                const capabilities = html5QrCodeRef.current.getRunningTrackCapabilities();
                 setIsTorchSupported(!!capabilities.torch);
-                
-                // Manual check for zoom because types are sometimes loose
-                const trackSettings = html5QrCodeRef.current?.getRunningTrackSettings();
-                // @ts-ignore - zoom is part of modern spec but library types might lag
+                // @ts-ignore
                 if (capabilities.zoom) {
                     // @ts-ignore
-                    setZoomCapability({ ...capabilities.zoom, value: trackSettings?.zoom || capabilities.zoom.min });
+                    const zoomVal = html5QrCodeRef.current?.getRunningTrackSettings()?.zoom || capabilities.zoom.min;
+                    // @ts-ignore
+                    setZoomCapability({ ...capabilities.zoom, value: zoomVal });
                 }
+            } catch(e) { console.log("Capabilities error", e); }
 
-                setState("scanning");
-            } catch (err: any) {
-                console.warn("Camera Start Error:", err);
-                const errorMessage = err?.toString() || "";
-
-                // Permission Denied Check
-                if (errorMessage.includes("NotAllowedError") || errorMessage.includes("PermissionDeniedError")) {
-                    setState("permission_denied");
-                    return; 
-                }
-
-                // If resolution was too high and not a permission error, retry with lower res
-                if (widthIdeal > 720) {
-                    await startCamera(640); 
-                } else {
-                    setState("error");
-                    if (!errorMessage.includes("NotAllowed")) {
-                        showToast("Camera failed to start.", "error");
-                    }
-                }
-            }
-        };
-
-        // Try 1080p+ ideal first for iPhone/High-End Android
-        await startCamera(1280);
+            setState("scanning");
+        } catch (err: any) {
+            console.error("Html5Qrcode start failed", err);
+            setState("error");
+            showToast("Failed to start camera feed. Please reload.", "error");
+        }
       },
       stop: async () => {
-        if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
-          try {
-            await html5QrCodeRef.current.stop();
-            setState("idle");
-          } catch (err) {
-            console.error("Error stopping scanner:", err);
-          }
-        }
+        await cleanup();
+        setState("idle");
       },
       pause: () => {
         if (html5QrCodeRef.current?.isScanning) html5QrCodeRef.current.pause(true);
@@ -371,9 +412,7 @@ const Scanner = forwardRef<ScannerControls, ScannerProps>(
     // Cleanup on unmount
     useEffect(() => {
         return () => {
-            if (html5QrCodeRef.current?.isScanning) {
-                html5QrCodeRef.current.stop().catch(e => console.error(e));
-            }
+            cleanup();
         };
     }, []);
 
@@ -420,7 +459,7 @@ const Scanner = forwardRef<ScannerControls, ScannerProps>(
         <div id="video-container" className="w-full h-full object-cover"></div>
         
         {/* Controls Overlay */}
-        <div className="absolute top-4 right-4 z-20 flex flex-col gap-3">
+        <div className={`absolute top-4 right-4 z-20 flex flex-col gap-3 transition-opacity duration-300 ${scannedResult ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
           {isTorchSupported && (
             <button onClick={toggleTorch} className="w-12 h-12 flex items-center justify-center bg-black/40 rounded-full text-white hover:bg-black/60 transition-colors cursor-pointer backdrop-blur-md border border-white/10 shadow-lg">
               {isTorchOn ? <ZapOff size={24} /> : <Zap size={24} />}
@@ -432,8 +471,8 @@ const Scanner = forwardRef<ScannerControls, ScannerProps>(
           <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
         </div>
 
-        {/* Zoom Slider - Critical for small codes */}
-        {zoomCapability && (
+        {/* Zoom Slider */}
+        {zoomCapability && !scannedResult && (
              <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-3/4 max-w-[200px] z-30 flex items-center gap-3 bg-black/30 backdrop-blur-md px-4 py-2 rounded-full border border-white/10">
                 <ZoomIn size={16} className="text-white/80" />
                 <input 
@@ -448,22 +487,44 @@ const Scanner = forwardRef<ScannerControls, ScannerProps>(
              </div>
         )}
 
-        {/* Visual Reticle */}
+        {/* Visual Reticle & Success Overlay */}
         <div className="absolute inset-0 pointer-events-none z-10 flex items-center justify-center">
-            <div className="relative w-[280px] h-[280px]">
+            <div className={`relative w-[280px] h-[280px] transition-all duration-300 ${scannedResult ? 'scale-105' : 'scale-100'}`}>
                 {/* Corners */}
-                <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-[var(--c-accent)] rounded-tl-lg shadow-[0_0_10px_rgba(0,0,0,0.5)]"></div>
-                <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-[var(--c-accent)] rounded-tr-lg shadow-[0_0_10px_rgba(0,0,0,0.5)]"></div>
-                <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-[var(--c-accent)] rounded-bl-lg shadow-[0_0_10px_rgba(0,0,0,0.5)]"></div>
-                <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-[var(--c-accent)] rounded-br-lg shadow-[0_0_10px_rgba(0,0,0,0.5)]"></div>
+                <div className={`absolute top-0 left-0 w-10 h-10 border-t-4 border-l-4 rounded-tl-xl transition-colors duration-300 shadow-[0_0_10px_rgba(0,0,0,0.5)] ${scannedResult ? 'border-[var(--c-success)]' : 'border-[var(--c-accent)]'}`}></div>
+                <div className={`absolute top-0 right-0 w-10 h-10 border-t-4 border-r-4 rounded-tr-xl transition-colors duration-300 shadow-[0_0_10px_rgba(0,0,0,0.5)] ${scannedResult ? 'border-[var(--c-success)]' : 'border-[var(--c-accent)]'}`}></div>
+                <div className={`absolute bottom-0 left-0 w-10 h-10 border-b-4 border-l-4 rounded-bl-xl transition-colors duration-300 shadow-[0_0_10px_rgba(0,0,0,0.5)] ${scannedResult ? 'border-[var(--c-success)]' : 'border-[var(--c-accent)]'}`}></div>
+                <div className={`absolute bottom-0 right-0 w-10 h-10 border-b-4 border-r-4 rounded-br-xl transition-colors duration-300 shadow-[0_0_10px_rgba(0,0,0,0.5)] ${scannedResult ? 'border-[var(--c-success)]' : 'border-[var(--c-accent)]'}`}></div>
                 
-                {/* Scan Line */}
-                <div className="absolute top-0 w-full h-0.5 bg-[var(--c-danger)] shadow-[0_0_15px_var(--c-danger)] animate-scan opacity-80"></div>
+                {/* Laser Scan Line */}
+                {!scannedResult && (
+                    <div className="scan-laser-line"></div>
+                )}
                 
+                {/* Success Overlay - Highlighting Battery ID */}
+                {scannedResult && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-auto rounded-xl z-50 overflow-hidden">
+                        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm"></div>
+                        <div className="success-scale-in flex flex-col items-center justify-center relative z-10 w-full p-4">
+                            <div className="w-20 h-20 bg-[var(--c-success)] rounded-full flex items-center justify-center mb-4 text-white shadow-[0_0_40px_rgba(34,197,94,0.6)] border-4 border-white/20">
+                                <CheckCircle size={40} strokeWidth={3} />
+                            </div>
+                            <div className="text-center w-full">
+                                <p className="text-[var(--c-success)] text-xs font-bold uppercase tracking-[0.2em] mb-2 drop-shadow-lg">Scanned Successfully</p>
+                                <div className="bg-white/10 border border-white/20 rounded-lg p-3 backdrop-blur-md">
+                                    <p className="text-white font-mono text-3xl font-black tracking-tight drop-shadow-2xl break-all">{scannedResult.id}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 {/* Guide Text */}
-                <p className="absolute -bottom-8 left-0 right-0 text-center text-white/80 text-sm font-medium drop-shadow-md">
-                    Align QR code within frame
-                </p>
+                {!scannedResult && (
+                    <p className="absolute -bottom-12 left-0 right-0 text-center text-white/80 text-sm font-medium drop-shadow-md bg-black/20 backdrop-blur-sm py-1 rounded-lg">
+                        Align QR code within frame
+                    </p>
+                )}
             </div>
         </div>
       </div>
@@ -574,11 +635,11 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
   const [items, setItems] = useState<{ name: string; count: number | "" }[]>([ { name: "Chargers", count: "" } ]);
   const [sessionEntries, setSessionEntries] = useState<BatteryEntry[]>([]);
   const [isListOpen, setIsListOpen] = useState(false);
+  const [showPermissionModal, setShowPermissionModal] = useState(true);
   const [scannerState, setScannerState] = useState<ScannerState>("idle");
   const [lastScannedEntry, setLastScannedEntry] = useState<BatteryEntry | null>(null);
   const [isProcessingScan, setIsProcessingScan] = useState(false);
   const [isAddItemModalOpen, setIsAddItemModalOpen] = useState(false);
-  const [isRequestingPermission, setIsRequestingPermission] = useState(false);
   
   const { commitSessionToHistory, triggerShare, showToast, profile } = useAppContext();
   const scannerRef = useRef<ScannerControls | null>(null);
@@ -586,38 +647,24 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
 
   useEffect(() => { sessionEntriesRef.current = sessionEntries; }, [sessionEntries]);
 
-  // Auto-start camera when stage becomes "scanning"
+  // Auto-advance logic
   useEffect(() => {
-    if (stage === "scanning") {
-      const timer = setTimeout(() => {
-        scannerRef.current?.start();
-      }, 100);
+      let timer: ReturnType<typeof setTimeout>;
+      if (lastScannedEntry) {
+          timer = setTimeout(() => {
+              handleContinueScanning();
+          }, 1500); // 1.5s delay for visual feedback
+      }
       return () => clearTimeout(timer);
-    }
-  }, [stage]);
+  }, [lastScannedEntry]);
 
-  const startScanning = async () => {
+  const startScanning = () => {
     if (!profile.stationId) {
       showToast("Please set a station profile first.", "error");
       onExit();
       return;
     }
-
-    // Explicitly request permissions on button click to satisfy browser security policies
-    setIsRequestingPermission(true);
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        // Permission granted! Stop the stream immediately, let the Scanner component handle the actual video feed later.
-        stream.getTracks().forEach(track => track.stop());
-        setStage("scanning");
-    } catch (error) {
-        console.error("Camera permission denied or error:", error);
-        // We still move to the scanning stage so the Scanner component can display the "Permission Denied" UI 
-        // with the nice instructions we built.
-        setStage("scanning");
-    } finally {
-        setIsRequestingPermission(false);
-    }
+    setStage("scanning");
   };
 
   const handleItemCountChange = (index: number, value: string) => {
@@ -634,6 +681,7 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
     // Check duplicates
     if (sessionEntriesRef.current.some(e => e.batteryId === decodedText)) {
       showToast("Battery already scanned.", "info");
+      // Short delay before allowing retry to prevent spam
       setTimeout(() => {
         setIsProcessingScan(false);
         scannerRef.current?.resume();
@@ -654,6 +702,7 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
   
   const handleContinueScanning = () => {
     setLastScannedEntry(null);
+    // Ensure state update propagates before resuming
     setTimeout(() => {
         setIsProcessingScan(false);
         scannerRef.current?.resume();
@@ -679,6 +728,16 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
         showToast("Session cancelled.", "info");
     }
     onExit();
+  };
+
+  const handleAllowCamera = async () => {
+    setShowPermissionModal(false);
+    // Short delay to ensure modal close animation doesn't jitter
+    setTimeout(() => {
+        if (scannerRef.current) {
+            scannerRef.current.start();
+        }
+    }, 100);
   };
 
   return (
@@ -717,13 +776,8 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
                 <PlusCircle size={18} /> Add Custom Item
               </button>
             </Card>
-            <button 
-                onClick={startScanning} 
-                disabled={items.some(i => i.count === "") || isRequestingPermission} 
-                className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90 disabled:opacity-50 cursor-pointer shadow-lg shadow-[var(--c-accent-glow)]"
-            >
-              {isRequestingPermission ? <Loader2 size={18} className="animate-spin" /> : <ChevronsRight size={18} />}
-              {isRequestingPermission ? "Requesting Camera..." : "Start Scanning"}
+            <button onClick={startScanning} disabled={items.some(i => i.count === "")} className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90 disabled:opacity-50 cursor-pointer shadow-lg shadow-[var(--c-accent-glow)]">
+              <ChevronsRight size={18} /> Start Scanning
             </button>
           </motion.div>
         ) : (
@@ -737,51 +791,29 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
                     </div>
                 )}
                 {scannerState === "error" && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center text-red-400 z-20 p-6 text-center">
+                    <div className="absolute inset-0 flex flex-col items-center justify-center text-red-400 z-20 p-6 text-center bg-black/80 backdrop-blur-sm">
                         <XCircle size={48} className="mb-4" />
-                        <p className="font-bold text-lg">Camera Error</p>
-                        <p className="text-sm mt-2 opacity-80">Please ensure you are using a mobile device with a working camera.</p>
-                        <button onClick={() => scannerRef.current?.start()} className="mt-6 px-6 py-2 bg-white/10 rounded-full text-white text-sm font-semibold hover:bg-white/20 transition-colors">
-                            Try Again
-                        </button>
-                    </div>
-                )}
-                {/* Robust Permission Denied UI */}
-                {scannerState === "permission_denied" && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/95 z-50 p-6 text-center text-white">
-                        <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mb-4 border border-red-500/30">
-                            <Lock size={32} className="text-red-500" />
-                        </div>
-                        <h3 className="text-xl font-bold mb-2">Camera Access Denied</h3>
-                        <p className="text-gray-300 mb-6 text-sm leading-relaxed max-w-xs">
-                            SnapStock cannot access your camera. To scan items, you must enable camera permissions in your browser.
+                        <p className="font-bold text-lg">Camera Connection Failed</p>
+                        <p className="text-sm mt-2 opacity-80 mb-6 max-w-xs mx-auto">
+                            We couldn't access your camera. Please ensure you have clicked "Allow" in the browser popup.
                         </p>
-                        <div className="bg-white/10 p-4 rounded-xl text-left w-full max-w-xs mb-8 space-y-4 border border-white/5">
-                             <div className="flex gap-3 text-sm text-gray-200">
-                                <span className="flex-shrink-0 w-6 h-6 bg-[var(--c-accent)] rounded-full flex items-center justify-center text-xs font-bold">1</span>
-                                <span>Tap the <strong>Lock Icon</strong> 🔒 or <strong>Settings</strong> ⚙️ in your browser's address bar.</span>
-                             </div>
-                             <div className="flex gap-3 text-sm text-gray-200">
-                                <span className="flex-shrink-0 w-6 h-6 bg-[var(--c-accent)] rounded-full flex items-center justify-center text-xs font-bold">2</span>
-                                <span>Find <strong>Camera</strong> and select <strong>Allow</strong> or <strong>Ask</strong>.</span>
-                             </div>
-                             <div className="flex gap-3 text-sm text-gray-200">
-                                <span className="flex-shrink-0 w-6 h-6 bg-[var(--c-accent)] rounded-full flex items-center justify-center text-xs font-bold">3</span>
-                                <span>Return here and tap <strong>Retry</strong>.</span>
-                             </div>
-                        </div>
-                        <div className="flex flex-col gap-3 w-full max-w-xs">
-                            <button onClick={() => scannerRef.current?.start()} className="bg-white text-black font-bold py-3.5 px-8 rounded-xl hover:bg-gray-200 transition-colors active:scale-95">
-                                Retry Access
-                            </button>
-                            <button onClick={onExit} className="text-sm text-gray-400 hover:text-white py-2">
-                                Cancel Session
-                            </button>
+                        <div className="flex gap-3">
+                             <button onClick={() => window.location.reload()} className="px-6 py-2.5 bg-white text-black font-semibold rounded-full hover:bg-gray-200 transition-colors flex items-center gap-2">
+                                <RefreshCw size={16} /> Reload App
+                             </button>
+                             <button onClick={() => { setShowPermissionModal(true); setScannerState("idle"); }} className="px-6 py-2.5 border border-white/30 text-white font-semibold rounded-full hover:bg-white/10 transition-colors">
+                                Try Again
+                             </button>
                         </div>
                     </div>
                 )}
-
-                <Scanner ref={scannerRef} onScanSuccess={handleScanSuccess} onStateChange={setScannerState} showToast={showToast} />
+                <Scanner 
+                    ref={scannerRef} 
+                    onScanSuccess={handleScanSuccess} 
+                    onStateChange={setScannerState} 
+                    showToast={showToast} 
+                    scannedResult={lastScannedEntry ? { id: lastScannedEntry.batteryId } : null}
+                />
             </div>
 
             {/* Bottom Sheet for Scanned Items */}
@@ -833,26 +865,27 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
 
       <AddItemModal isOpen={isAddItemModalOpen} onClose={() => setIsAddItemModalOpen(false)} onAdd={(name) => setItems([...items, { name, count: "" }])} />
 
-      <Modal isOpen={!!lastScannedEntry} onClose={handleContinueScanning} title="Scan Successful" hideCloseButton>
-        {lastScannedEntry && (
-            <div className="text-center space-y-6 py-2">
-                <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto">
-                    <CheckCircle size={40} className="text-[var(--c-success)]" />
-                </div>
-                <div>
-                    <p className="text-sm text-[var(--c-text-alt)] uppercase tracking-wide font-semibold">Battery ID</p>
-                    <p className="font-mono text-3xl font-bold text-[var(--c-text)] mt-1">{lastScannedEntry.batteryId}</p>
-                </div>
-                <div className="flex flex-col gap-3 pt-2">
-                    <button onClick={handleContinueScanning} className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90">
-                        <ScanLine size={18} /> Scan Next
-                    </button>
-                    <button onClick={() => { setLastScannedEntry(null); completeAndSave(); }} className="w-full text-center text-[var(--c-text-alt)] font-medium py-2 hover:text-[var(--c-text)]">
-                        Finish Session
-                    </button>
+      <Modal isOpen={stage === "scanning" && showPermissionModal} hideCloseButton title="Camera Access Required">
+        <div className="text-center">
+            <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-5 relative">
+                <Camera size={36} className="text-[var(--c-accent)]" />
+                <div className="absolute -bottom-1 -right-1 bg-green-500 rounded-full p-1.5 border-4 border-white">
+                    <ShieldCheck size={14} className="text-white" />
                 </div>
             </div>
-        )}
+            <p className="text-[var(--c-text)] font-semibold text-lg mb-2">Ready to Scan?</p>
+            <p className="text-sm text-[var(--c-text-alt)] mb-6 leading-relaxed px-2">
+                SnapStock needs to access your camera to scan barcodes.
+                <br/><br/>
+                <strong>Please look for the browser popup and click "Allow".</strong>
+            </p>
+            <button onClick={handleAllowCamera} className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90 shadow-lg shadow-indigo-200">
+                Start Scanner
+            </button>
+             <p className="text-xs text-[var(--c-text-faint)] mt-4">
+                If the popup doesn't appear, check the lock icon in your address bar.
+            </p>
+        </div>
       </Modal>
     </motion.div>
   );
