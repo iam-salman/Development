@@ -47,7 +47,6 @@ import {
   Search,
   Camera,
   ShieldCheck,
-  Settings,
   RefreshCw
 } from "lucide-react";
 
