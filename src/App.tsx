@@ -34,6 +34,7 @@ import {
   ChevronsRight,
   Target,
   BatteryCharging,
+  Calendar,
   Clock,
   XCircle,
   Boxes,
@@ -45,7 +46,9 @@ import {
   Trash2,
   ZoomIn,
   Search,
-  Lock
+  Settings,
+  Lock,
+  Loader2
 } from "lucide-react";
 
 // --- Global Types & Styles ---
@@ -575,6 +578,7 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
   const [lastScannedEntry, setLastScannedEntry] = useState<BatteryEntry | null>(null);
   const [isProcessingScan, setIsProcessingScan] = useState(false);
   const [isAddItemModalOpen, setIsAddItemModalOpen] = useState(false);
+  const [isRequestingPermission, setIsRequestingPermission] = useState(false);
   
   const { commitSessionToHistory, triggerShare, showToast, profile } = useAppContext();
   const scannerRef = useRef<ScannerControls | null>(null);
@@ -592,13 +596,28 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
     }
   }, [stage]);
 
-  const startScanning = () => {
+  const startScanning = async () => {
     if (!profile.stationId) {
       showToast("Please set a station profile first.", "error");
       onExit();
       return;
     }
-    setStage("scanning");
+
+    // Explicitly request permissions on button click to satisfy browser security policies
+    setIsRequestingPermission(true);
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // Permission granted! Stop the stream immediately, let the Scanner component handle the actual video feed later.
+        stream.getTracks().forEach(track => track.stop());
+        setStage("scanning");
+    } catch (error) {
+        console.error("Camera permission denied or error:", error);
+        // We still move to the scanning stage so the Scanner component can display the "Permission Denied" UI 
+        // with the nice instructions we built.
+        setStage("scanning");
+    } finally {
+        setIsRequestingPermission(false);
+    }
   };
 
   const handleItemCountChange = (index: number, value: string) => {
@@ -698,8 +717,13 @@ const ScanningFlow: FC<{ onExit: () => void }> = ({ onExit }) => {
                 <PlusCircle size={18} /> Add Custom Item
               </button>
             </Card>
-            <button onClick={startScanning} disabled={items.some(i => i.count === "")} className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90 disabled:opacity-50 cursor-pointer shadow-lg shadow-[var(--c-accent-glow)]">
-              <ChevronsRight size={18} /> Start Scanning
+            <button 
+                onClick={startScanning} 
+                disabled={items.some(i => i.count === "") || isRequestingPermission} 
+                className="w-full flex items-center justify-center gap-2 bg-[var(--c-accent)] text-[var(--c-accent-text)] font-bold py-3.5 rounded-xl transition-all active:scale-95 hover:opacity-90 disabled:opacity-50 cursor-pointer shadow-lg shadow-[var(--c-accent-glow)]"
+            >
+              {isRequestingPermission ? <Loader2 size={18} className="animate-spin" /> : <ChevronsRight size={18} />}
+              {isRequestingPermission ? "Requesting Camera..." : "Start Scanning"}
             </button>
           </motion.div>
         ) : (
